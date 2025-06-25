@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use cargo_metadata::{Metadata, MetadataCommand};
+use cargo_metadata::{Metadata, MetadataCommand, PackageId};
 use clap::Parser;
 use fs_extra::dir::{self, CopyOptions};
+use std::collections::HashMap;
 use std::fs::{self, remove_file};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, Value};
@@ -66,8 +67,22 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
 
     println!("Using cargo registry: {}", cargo_home.display());
 
-    for package in &metadata.packages {
-        // Skip workspace packages (packages that are part of the current project)
+    // Create a map of PackageId to Package for quick lookup
+    let package_map: HashMap<PackageId, &cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .map(|p| (p.id.clone(), p))
+        .collect();
+
+    // Get the resolved dependency graph
+    let resolve = metadata.resolve.as_ref().context("No resolve data in metadata")?;
+
+    for node in &resolve.nodes {
+        let package = package_map
+            .get(&node.id)
+            .context(format!("Package {} not found in metadata", node.id))?;
+
+        // Skip workspace packages
         if is_workspace_package(package, metadata.workspace_root.as_std_path()) {
             println!("Skipping workspace package: {}", package.name);
             continue;
@@ -87,7 +102,7 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
         let options = CopyOptions::new().overwrite(true);
         dir::copy(&source_path, &third_party_path, &options)
             .context(format!("Failed to copy {} to {}", source_path.display(), third_party_path.display()))?;
-        
+
         println!("  Copied: {} -> {}", source_path.display(), dest_path.display());
     }
 
@@ -305,19 +320,27 @@ fn update_dependencies(
 }
 
 fn find_package_for_dependency<'a>(
-    metadata: &'a Metadata, 
-    dep_name: &'a str, 
-    package_name: Option<&'a str>
+    metadata: &'a Metadata,
+    dep_name: &'a str,
+    package_name: Option<&'a str>,
 ) -> Option<&'a cargo_metadata::Package> {
-    // First try to find by the actual package name (if package = "..." is specified)
-    if let Some(actual_package_name) = package_name {
-        if let Some(package) = metadata.packages.iter().rfind(|p| p.name == actual_package_name) {
+    let resolve = metadata.resolve.as_ref()?;
+    let package_map: HashMap<PackageId, &cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .map(|p| (p.id.clone(), p))
+        .collect();
+
+    // Find the package in the resolved dependency graph
+    for node in &resolve.nodes {
+        let package = package_map.get(&node.id)?;
+        let actual_name = package_name.unwrap_or(dep_name);
+        if package.name == actual_name {
             return Some(package);
         }
     }
-    
-    // Then try to find by the dependency name
-    metadata.packages.iter().rfind(|p| p.name == dep_name)
+
+    None
 }
 
 fn get_package_name_from_table(table: &toml_edit::InlineTable, _dep_name: &str) -> Option<String> {
