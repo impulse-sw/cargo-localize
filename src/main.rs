@@ -1,0 +1,333 @@
+use anyhow::{Context, Result};
+use cargo_metadata::{Metadata, MetadataCommand};
+use clap::Parser;
+use fs_extra::dir::{self, CopyOptions};
+use std::fs::{self, remove_file};
+use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table, Value};
+use walkdir::WalkDir;
+
+#[derive(Parser)]
+#[clap(name = "cargo-localize", about = "Localizes all dependencies into a 3rd-party folder")]
+struct Args {
+    #[clap(default_value = ".")]
+    project_path: PathBuf,
+    #[clap(long, default_value = "3rd-party")]
+    third_party_dir: String,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let project_path = args.project_path.canonicalize().context("Invalid project path")?;
+    let third_party_path = project_path.join(&args.third_party_dir);
+
+    println!("Running cargo fetch...");
+    std::process::Command::new("cargo")
+        .arg("fetch")
+        .current_dir(&project_path)
+        .status()
+        .context("Failed to run cargo fetch")?;
+
+    println!("Getting metadata...");
+    let metadata = MetadataCommand::new()
+        .manifest_path(project_path.join("Cargo.toml"))
+        .exec()
+        .context("Failed to get cargo metadata")?;
+
+    fs::create_dir_all(&third_party_path).context("Failed to create 3rd-party directory")?;
+
+    println!("Copying dependencies...");
+    copy_dependencies(&metadata, &third_party_path)?;
+
+    println!("Updating Cargo.toml files...");
+    update_cargo_toml(&metadata, &project_path, &third_party_path)?;
+
+    let lock_file = project_path.join("Cargo.lock");
+    if lock_file.exists() {
+        remove_file(&lock_file).context("Failed to remove Cargo.lock")?;
+    }
+
+    println!("Dependencies localized to {}", third_party_path.display());
+    Ok(())
+}
+
+fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()> {
+    // Try multiple possible cargo registry locations
+    let possible_cargo_homes = vec![
+        dirs::home_dir().map(|p| p.join(".cargo/registry/src")),
+        std::env::var("CARGO_HOME").ok().map(|p| PathBuf::from(p).join("registry/src")),
+    ];
+
+    let cargo_home = possible_cargo_homes
+        .into_iter()
+        .find_map(|p| p.filter(|path| path.exists()))
+        .context("Failed to find Cargo registry directory")?;
+
+    println!("Using cargo registry: {}", cargo_home.display());
+
+    for package in &metadata.packages {
+        // Skip workspace packages (packages that are part of the current project)
+        if is_workspace_package(package, metadata.workspace_root.as_std_path()) {
+            println!("Skipping workspace package: {}", package.name);
+            continue;
+        }
+
+        println!("Processing dependency: {} v{}", package.name, package.version);
+
+        let source_path = find_crate_source(&cargo_home, &package.name, &package.version.to_string())?;
+        let dest_name = format!("{}-{}", package.name, package.version);
+        let dest_path = third_party_path.join(&dest_name);
+
+        if dest_path.exists() {
+            println!("  Already exists: {}", dest_path.display());
+            continue;
+        }
+
+        let options = CopyOptions::new().overwrite(true);
+        dir::copy(&source_path, &third_party_path, &options)
+            .context(format!("Failed to copy {} to {}", source_path.display(), third_party_path.display()))?;
+        
+        println!("  Copied: {} -> {}", source_path.display(), dest_path.display());
+    }
+
+    Ok(())
+}
+
+fn is_workspace_package(package: &cargo_metadata::Package, workspace_root: &Path) -> bool {
+    // Check if the package manifest is within the workspace
+    package.manifest_path.starts_with(workspace_root)
+}
+
+fn find_crate_source(cargo_home: &Path, name: &str, version: &str) -> Result<PathBuf> {
+    println!("  Looking for crate source: {}-{}", name, version);
+    
+    // Look in all registry source directories
+    for registry_entry in fs::read_dir(cargo_home)? {
+        let registry_entry = registry_entry?;
+        if !registry_entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let registry_path = registry_entry.path();
+        println!("    Searching in registry: {}", registry_path.display());
+
+        // Search for the specific crate version
+        for entry in WalkDir::new(&registry_path)
+            .max_depth(2)
+            .into_iter()
+            .filter_entry(|e| e.file_type().is_dir())
+        {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if let Some(dir_name) = path.file_name() {
+                let dir_name_str = dir_name.to_string_lossy();
+                
+                // Match exact version: crate-name-version
+                if dir_name_str == format!("{}-{}", name, version) {
+                    println!("    Found: {}", path.display());
+                    return Ok(path.to_path_buf());
+                }
+            }
+        }
+    }
+    
+    Err(anyhow::anyhow!("Crate {}:{} not found in Cargo registry at {}", name, version, cargo_home.display()))
+}
+
+fn update_cargo_toml(metadata: &Metadata, project_path: &Path, third_party_path: &Path) -> Result<()> {
+    // Always update the main Cargo.toml
+    println!("Updating main Cargo.toml");
+    update_single_cargo_toml(&metadata, &project_path.join("Cargo.toml"), project_path, third_party_path)?;
+
+    // Update Cargo.toml files for each copied dependency
+    for package in &metadata.packages {
+        if is_workspace_package(package, metadata.workspace_root.as_std_path()) {
+            continue;
+        }
+        
+        let crate_dir_name = format!("{}-{}", package.name, package.version);
+        let cargo_toml_path = third_party_path.join(&crate_dir_name).join("Cargo.toml");
+        
+        if cargo_toml_path.exists() {
+            println!("Updating dependency Cargo.toml: {}", cargo_toml_path.display());
+            update_single_cargo_toml(&metadata, &cargo_toml_path, project_path, third_party_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn update_single_cargo_toml(
+    metadata: &Metadata,
+    cargo_toml_path: &Path,
+    _project_path: &Path,
+    third_party_path: &Path,
+) -> Result<()> {
+    let content = fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
+    let mut doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
+
+    // Process all dependency sections
+    let sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+    for section in &sections {
+        if let Some(deps) = doc.get_mut(section).and_then(|t| t.as_table_mut()) {
+            update_dependencies(deps, metadata, cargo_toml_path, third_party_path)?;
+        }
+    }
+
+    // Process target-specific dependencies
+    if let Some(target_table) = doc.get_mut("target").and_then(|t| t.as_table_mut()) {
+        for (_, target_value) in target_table.iter_mut() {
+            if let Some(target_spec) = target_value.as_table_mut() {
+                for section in &sections {
+                    if let Some(deps) = target_spec.get_mut(section).and_then(|t| t.as_table_mut()) {
+                        update_dependencies(deps, metadata, cargo_toml_path, third_party_path)?;
+                    }
+                }
+            }
+        }
+    }
+
+    fs::write(cargo_toml_path, doc.to_string()).context("Failed to write Cargo.toml")?;
+    Ok(())
+}
+
+fn update_dependencies(
+    deps: &mut Table,
+    metadata: &Metadata,
+    cargo_toml_path: &Path,
+    third_party_path: &Path,
+) -> Result<()> {
+    for (dep_name, dep_value) in deps.iter_mut() {
+        println!("  Processing dependency: {}", dep_name);
+        
+        match dep_value {
+            Item::Value(Value::String(_)) => {
+                // Simple version string dependency
+                let package = find_package_for_dependency(metadata, dep_name.get(), None);
+                if let Some(package) = package {
+                    let crate_dir_name = format!("{}-{}", package.name, package.version);
+                    let dep_path = third_party_path.join(&crate_dir_name);
+                    
+                    if dep_path.exists() {
+                        let rel_path = pathdiff::diff_paths(&dep_path, cargo_toml_path.parent().unwrap())
+                            .context("Failed to compute relative path")?;
+                        
+                        *dep_value = Item::Value(Value::InlineTable({
+                            let mut table = toml_edit::InlineTable::new();
+                            table.insert("path", Value::String(toml_edit::Formatted::new(
+                                rel_path.to_string_lossy().to_string(),
+                            )));
+                            table
+                        }));
+                        
+                        println!("    Updated dependency: {} -> path = {}", dep_name, rel_path.display());
+                    } else {
+                        println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
+                    }
+                } else {
+                    println!("    Skipping dependency: {} (not found in metadata)", dep_name);
+                }
+            }
+            Item::Value(Value::InlineTable(table)) => {
+                // Inline table dependency
+                let package_name = get_package_name_from_table(table, dep_name.get());
+                let package = find_package_for_dependency(metadata, dep_name.get(), package_name.as_deref());
+                
+                if let Some(package) = package {
+                    let crate_dir_name = format!("{}-{}", package.name, package.version);
+                    let dep_path = third_party_path.join(&crate_dir_name);
+                    
+                    if dep_path.exists() {
+                        let rel_path = pathdiff::diff_paths(&dep_path, cargo_toml_path.parent().unwrap())
+                            .context("Failed to compute relative path")?;
+                        
+                        // Remove external source fields
+                        table.remove("version");
+                        table.remove("git");
+                        table.remove("branch");
+                        table.remove("tag");
+                        table.remove("rev");
+                        table.remove("registry");
+                        
+                        // Add path
+                        table.insert("path", Value::String(toml_edit::Formatted::new(
+                            rel_path.to_string_lossy().to_string(),
+                        )));
+                        
+                        println!("    Updated dependency: {} -> path = {}", dep_name, rel_path.display());
+                    } else {
+                        println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
+                    }
+                } else {
+                    println!("    Skipping dependency: {} (not found in metadata)", dep_name);
+                }
+            }
+            Item::Table(table) => {
+                // Full table dependency
+                let package_name = get_package_name_from_table_item(table, dep_name.get());
+                let package = find_package_for_dependency(metadata, dep_name.get(), package_name.as_deref());
+                
+                if let Some(package) = package {
+                    let crate_dir_name = format!("{}-{}", package.name, package.version);
+                    let dep_path = third_party_path.join(&crate_dir_name);
+                    
+                    if dep_path.exists() {
+                        let rel_path = pathdiff::diff_paths(&dep_path, cargo_toml_path.parent().unwrap())
+                            .context("Failed to compute relative path")?;
+                        
+                        // Remove external source fields
+                        table.remove("version");
+                        table.remove("git");
+                        table.remove("branch");
+                        table.remove("tag");
+                        table.remove("rev");
+                        table.remove("registry");
+                        
+                        // Add path
+                        table.insert("path", Item::Value(Value::String(toml_edit::Formatted::new(
+                            rel_path.to_string_lossy().to_string(),
+                        ))));
+                        
+                        println!("    Updated dependency: {} -> path = {}", dep_name, rel_path.display());
+                    } else {
+                        println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
+                    }
+                } else {
+                    println!("    Skipping dependency: {} (not found in metadata)", dep_name);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn find_package_for_dependency<'a>(
+    metadata: &'a Metadata, 
+    dep_name: &'a str, 
+    package_name: Option<&'a str>
+) -> Option<&'a cargo_metadata::Package> {
+    // First try to find by the actual package name (if package = "..." is specified)
+    if let Some(actual_package_name) = package_name {
+        if let Some(package) = metadata.packages.iter().rfind(|p| p.name == actual_package_name) {
+            return Some(package);
+        }
+    }
+    
+    // Then try to find by the dependency name
+    metadata.packages.iter().rfind(|p| p.name == dep_name)
+}
+
+fn get_package_name_from_table(table: &toml_edit::InlineTable, _dep_name: &str) -> Option<String> {
+    table.get("package")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn get_package_name_from_table_item(table: &Table, _dep_name: &str) -> Option<String> {
+    table.get("package")
+        .and_then(|item| item.as_str())
+        .map(|s| s.to_string())
+}
