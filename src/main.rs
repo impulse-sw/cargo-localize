@@ -5,7 +5,7 @@ use fs_extra::dir::{self, CopyOptions};
 use std::collections::HashMap;
 use std::fs::{self, remove_file};
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{Array, DocumentMut, Item, Table, Value};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -88,7 +88,10 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
             continue;
         }
 
-        println!("Processing dependency: {} v{}", package.name, package.version);
+        println!(
+            "Processing dependency: {} v{} with features: {:?}",
+            package.name, package.version, node.features
+        );
 
         let source_path = find_crate_source(&cargo_home, &package.name, &package.version.to_string())?;
         let dest_name = format!("{}-{}", package.name, package.version);
@@ -100,8 +103,11 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
         }
 
         let options = CopyOptions::new().overwrite(true);
-        dir::copy(&source_path, &third_party_path, &options)
-            .context(format!("Failed to copy {} to {}", source_path.display(), third_party_path.display()))?;
+        dir::copy(&source_path, &third_party_path, &options).context(format!(
+            "Failed to copy {} to {}",
+            source_path.display(),
+            third_party_path.display()
+        ))?;
 
         println!("  Copied: {} -> {}", source_path.display(), dest_path.display());
     }
@@ -217,28 +223,37 @@ fn update_dependencies(
 ) -> Result<()> {
     for (dep_name, dep_value) in deps.iter_mut() {
         println!("  Processing dependency: {}", dep_name);
-        
+
         match dep_value {
             Item::Value(Value::String(_)) => {
                 // Simple version string dependency
-                let package = find_package_for_dependency(metadata, dep_name.get(), None);
-                if let Some(package) = package {
+                let package_info = find_package_for_dependency(metadata, dep_name.get(), None);
+                if let Some((package, features)) = package_info {
                     let crate_dir_name = format!("{}-{}", package.name, package.version);
                     let dep_path = third_party_path.join(&crate_dir_name);
-                    
+
                     if dep_path.exists() {
                         let rel_path = pathdiff::diff_paths(&dep_path, cargo_toml_path.parent().unwrap())
                             .context("Failed to compute relative path")?;
-                        
-                        *dep_value = Item::Value(Value::InlineTable({
-                            let mut table = toml_edit::InlineTable::new();
-                            table.insert("path", Value::String(toml_edit::Formatted::new(
+
+                        let mut table = toml_edit::InlineTable::new();
+                        table.insert(
+                            "path",
+                            Value::String(toml_edit::Formatted::new(
                                 rel_path.to_string_lossy().to_string(),
-                            )));
-                            table
-                        }));
-                        
-                        println!("    Updated dependency: {} -> path = {}", dep_name, rel_path.display());
+                            )),
+                        );
+                        if !features.is_empty() {
+                            let mut feature_array = Array::new();
+                            for feature in &features {
+                                feature_array.push(feature);
+                            }
+                            table.insert("features", Value::Array(feature_array));
+                        }
+
+                        *dep_value = Item::Value(Value::InlineTable(table));
+
+                        println!("    Updated dependency: {} -> path = {}, features = {:?}", dep_name, rel_path.display(), features);
                     } else {
                         println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
                     }
@@ -249,16 +264,16 @@ fn update_dependencies(
             Item::Value(Value::InlineTable(table)) => {
                 // Inline table dependency
                 let package_name = get_package_name_from_table(table, dep_name.get());
-                let package = find_package_for_dependency(metadata, dep_name.get(), package_name.as_deref());
-                
-                if let Some(package) = package {
+                let package_info = find_package_for_dependency(metadata, dep_name.get(), package_name.as_deref());
+
+                if let Some((package, features)) = package_info {
                     let crate_dir_name = format!("{}-{}", package.name, package.version);
                     let dep_path = third_party_path.join(&crate_dir_name);
-                    
+
                     if dep_path.exists() {
                         let rel_path = pathdiff::diff_paths(&dep_path, cargo_toml_path.parent().unwrap())
                             .context("Failed to compute relative path")?;
-                        
+
                         // Remove external source fields
                         table.remove("version");
                         table.remove("git");
@@ -266,13 +281,25 @@ fn update_dependencies(
                         table.remove("tag");
                         table.remove("rev");
                         table.remove("registry");
-                        
+
                         // Add path
-                        table.insert("path", Value::String(toml_edit::Formatted::new(
-                            rel_path.to_string_lossy().to_string(),
-                        )));
-                        
-                        println!("    Updated dependency: {} -> path = {}", dep_name, rel_path.display());
+                        table.insert(
+                            "path",
+                            Value::String(toml_edit::Formatted::new(
+                                rel_path.to_string_lossy().to_string(),
+                            )),
+                        );
+
+                        // Add features if any
+                        if !features.is_empty() {
+                            let mut feature_array = Array::new();
+                            for feature in &features {
+                                feature_array.push(feature);
+                            }
+                            table.insert("features", Value::Array(feature_array));
+                        }
+
+                        println!("    Updated dependency: {} -> path = {}, features = {:?}", dep_name, rel_path.display(), features);
                     } else {
                         println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
                     }
@@ -283,16 +310,16 @@ fn update_dependencies(
             Item::Table(table) => {
                 // Full table dependency
                 let package_name = get_package_name_from_table_item(table, dep_name.get());
-                let package = find_package_for_dependency(metadata, dep_name.get(), package_name.as_deref());
-                
-                if let Some(package) = package {
+                let package_info = find_package_for_dependency(metadata, dep_name.get(), package_name.as_deref());
+
+                if let Some((package, features)) = package_info {
                     let crate_dir_name = format!("{}-{}", package.name, package.version);
                     let dep_path = third_party_path.join(&crate_dir_name);
-                    
+
                     if dep_path.exists() {
                         let rel_path = pathdiff::diff_paths(&dep_path, cargo_toml_path.parent().unwrap())
                             .context("Failed to compute relative path")?;
-                        
+
                         // Remove external source fields
                         table.remove("version");
                         table.remove("git");
@@ -300,13 +327,25 @@ fn update_dependencies(
                         table.remove("tag");
                         table.remove("rev");
                         table.remove("registry");
-                        
+
                         // Add path
-                        table.insert("path", Item::Value(Value::String(toml_edit::Formatted::new(
-                            rel_path.to_string_lossy().to_string(),
-                        ))));
-                        
-                        println!("    Updated dependency: {} -> path = {}", dep_name, rel_path.display());
+                        table.insert(
+                            "path",
+                            Item::Value(Value::String(toml_edit::Formatted::new(
+                                rel_path.to_string_lossy().to_string(),
+                            ))),
+                        );
+
+                        // Add features if any
+                        if !features.is_empty() {
+                            let mut feature_array = Array::new();
+                            for feature in &features {
+                                feature_array.push(feature);
+                            }
+                            table.insert("features", Item::Value(Value::Array(feature_array)));
+                        }
+
+                        println!("    Updated dependency: {} -> path = {}, features = {:?}", dep_name, rel_path.display(), features);
                     } else {
                         println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
                     }
@@ -324,7 +363,7 @@ fn find_package_for_dependency<'a>(
     metadata: &'a Metadata,
     dep_name: &'a str,
     package_name: Option<&'a str>,
-) -> Option<&'a cargo_metadata::Package> {
+) -> Option<(&'a cargo_metadata::Package, Vec<String>)> {
     let resolve = metadata.resolve.as_ref()?;
     let package_map: HashMap<PackageId, &cargo_metadata::Package> = metadata
         .packages
@@ -337,7 +376,7 @@ fn find_package_for_dependency<'a>(
         let package = package_map.get(&node.id)?;
         let actual_name = package_name.unwrap_or(dep_name);
         if package.name == actual_name {
-            return Some(package);
+            return Some((package, node.features.clone()));
         }
     }
 
