@@ -186,6 +186,10 @@ fn update_single_cargo_toml(
     _project_path: &Path,
     third_party_path: &Path,
 ) -> Result<()> {
+    let bak_filepath = cargo_toml_path.to_string_lossy().to_string() + ".bak";
+    if !fs::exists(&bak_filepath).is_ok_and(|v| v) {
+        fs::copy(cargo_toml_path, bak_filepath).context("Failed to backup Cargo.toml to Cargo.toml.bak")?;
+    }
     let content = fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
     let mut doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
 
@@ -211,6 +215,12 @@ fn update_single_cargo_toml(
     }
 
     fs::write(cargo_toml_path, doc.to_string()).context("Failed to write Cargo.toml")?;
+    
+    let orig_filepath = cargo_toml_path.to_string_lossy().to_string() + ".orig";
+    if fs::exists(&orig_filepath).is_ok_and(|v| v) {
+        fs::remove_file(orig_filepath).context("Failed to remove Cargo.toml.orig")?;
+    }
+    
     Ok(())
 }
 
