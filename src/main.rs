@@ -180,6 +180,7 @@ fn update_single_cargo_toml(
     _project_path: &Path,
     third_party_path: &Path,
 ) -> Result<()> {
+    fs::copy(cargo_toml_path, cargo_toml_path.to_string_lossy().to_string() + ".bak").context("Failed to backup Cargo.toml to Cargo.toml.bak")?;
     let content = fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
     let mut doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
 
