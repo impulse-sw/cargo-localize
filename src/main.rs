@@ -1,15 +1,20 @@
+#![deny(warnings, clippy::unimplemented, clippy::todo)]
+
 use anyhow::{Context, Result};
 use cargo_metadata::{Metadata, MetadataCommand, PackageId};
 use clap::Parser;
 use fs_extra::dir::{self, CopyOptions};
 use std::collections::HashMap;
-use std::fs::{self, remove_file};
+use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
-#[clap(name = "cargo-localize", about = "Localizes all dependencies into a 3rd-party folder")]
+#[clap(
+    name = "cargo-localize",
+    about = "Localizes all dependencies into a 3rd-party folder"
+)]
 struct Args {
     #[clap(default_value = ".")]
     project_path: PathBuf,
@@ -46,7 +51,7 @@ fn main() -> Result<()> {
 
     let lock_file = project_path.join("Cargo.lock");
     if lock_file.exists() {
-        remove_file(&lock_file).context("Failed to remove Cargo.lock")?;
+        fs::remove_file(&lock_file).context("Failed to remove Cargo.lock")?;
     }
 
     println!("Dependencies localized to {}", third_party_path.display());
@@ -57,7 +62,9 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
     // Try multiple possible cargo registry locations
     let possible_cargo_homes = vec![
         dirs::home_dir().map(|p| p.join(".cargo/registry/src")),
-        std::env::var("CARGO_HOME").ok().map(|p| PathBuf::from(p).join("registry/src")),
+        std::env::var("CARGO_HOME")
+            .ok()
+            .map(|p| PathBuf::from(p).join("registry/src")),
     ];
 
     let cargo_home = possible_cargo_homes
@@ -68,11 +75,8 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
     println!("Using cargo registry: {}", cargo_home.display());
 
     // Create a map of PackageId to Package for quick lookup
-    let package_map: HashMap<PackageId, &cargo_metadata::Package> = metadata
-        .packages
-        .iter()
-        .map(|p| (p.id.clone(), p))
-        .collect();
+    let package_map: HashMap<PackageId, &cargo_metadata::Package> =
+        metadata.packages.iter().map(|p| (p.id.clone(), p)).collect();
 
     // Get the resolved dependency graph
     let resolve = metadata.resolve.as_ref().context("No resolve data in metadata")?;
@@ -103,7 +107,7 @@ fn copy_dependencies(metadata: &Metadata, third_party_path: &Path) -> Result<()>
         }
 
         let options = CopyOptions::new().overwrite(true);
-        dir::copy(&source_path, &third_party_path, &options).context(format!(
+        dir::copy(&source_path, third_party_path, &options).context(format!(
             "Failed to copy {} to {}",
             source_path.display(),
             third_party_path.display()
@@ -121,8 +125,8 @@ fn is_workspace_package(package: &cargo_metadata::Package, workspace_root: &Path
 }
 
 fn find_crate_source(cargo_home: &Path, name: &str, version: &str) -> Result<PathBuf> {
-    println!("  Looking for crate source: {}-{}", name, version);
-    
+    println!("  Looking for crate source: {name}-{version}");
+
     // Look in all registry source directories
     for registry_entry in fs::read_dir(cargo_home)? {
         let registry_entry = registry_entry?;
@@ -141,39 +145,47 @@ fn find_crate_source(cargo_home: &Path, name: &str, version: &str) -> Result<Pat
         {
             let entry = entry?;
             let path = entry.path();
-            
+
             if let Some(dir_name) = path.file_name() {
                 let dir_name_str = dir_name.to_string_lossy();
-                
+
                 // Match exact version: crate-name-version
-                if dir_name_str == format!("{}-{}", name, version) {
+                if dir_name_str == format!("{name}-{version}") {
                     println!("    Found: {}", path.display());
                     return Ok(path.to_path_buf());
                 }
             }
         }
     }
-    
-    Err(anyhow::anyhow!("Crate {}:{} not found in Cargo registry at {}", name, version, cargo_home.display()))
+
+    Err(anyhow::anyhow!(
+        "Crate {name}:{version} not found in Cargo registry at {}",
+        cargo_home.display()
+    ))
 }
 
 fn update_cargo_toml(metadata: &Metadata, project_path: &Path, third_party_path: &Path) -> Result<()> {
     // Always update the main Cargo.toml
     println!("Updating main Cargo.toml");
-    update_single_cargo_toml(&metadata, &project_path.join("Cargo.toml"), project_path, third_party_path)?;
+    update_single_cargo_toml(
+        metadata,
+        &project_path.join("Cargo.toml"),
+        project_path,
+        third_party_path,
+    )?;
 
     // Update Cargo.toml files for each copied dependency
     for package in &metadata.packages {
         if is_workspace_package(package, metadata.workspace_root.as_std_path()) {
             continue;
         }
-        
+
         let crate_dir_name = format!("{}-{}", package.name, package.version);
         let cargo_toml_path = third_party_path.join(&crate_dir_name).join("Cargo.toml");
-        
+
         if cargo_toml_path.exists() {
             println!("Updating dependency Cargo.toml: {}", cargo_toml_path.display());
-            update_single_cargo_toml(&metadata, &cargo_toml_path, project_path, third_party_path)?;
+            update_single_cargo_toml(metadata, &cargo_toml_path, project_path, third_party_path)?;
         }
     }
 
@@ -215,12 +227,12 @@ fn update_single_cargo_toml(
     }
 
     fs::write(cargo_toml_path, doc.to_string()).context("Failed to write Cargo.toml")?;
-    
+
     let orig_filepath = cargo_toml_path.to_string_lossy().to_string() + ".orig";
     if fs::exists(&orig_filepath).is_ok_and(|v| v) {
         fs::remove_file(orig_filepath).context("Failed to remove Cargo.toml.orig")?;
     }
-    
+
     Ok(())
 }
 
@@ -231,7 +243,7 @@ fn update_dependencies(
     third_party_path: &Path,
 ) -> Result<()> {
     for (dep_name, dep_value) in deps.iter_mut() {
-        println!("  Processing dependency: {}", dep_name);
+        println!("  Processing dependency: {dep_name}");
 
         match dep_value {
             Item::Value(Value::String(_)) => {
@@ -248,9 +260,7 @@ fn update_dependencies(
                         let mut table = toml_edit::InlineTable::new();
                         table.insert(
                             "path",
-                            Value::String(toml_edit::Formatted::new(
-                                rel_path.to_string_lossy().to_string(),
-                            )),
+                            Value::String(toml_edit::Formatted::new(rel_path.to_string_lossy().to_string())),
                         );
                         if !features.is_empty() {
                             let mut feature_array = Array::new();
@@ -262,12 +272,15 @@ fn update_dependencies(
 
                         *dep_value = Item::Value(Value::InlineTable(table));
 
-                        println!("    Updated dependency: {} -> path = {}, features = {:?}", dep_name, rel_path.display(), features);
+                        println!(
+                            "    Updated dependency: {dep_name} -> path = {}, features = {features:?}",
+                            rel_path.display(),
+                        );
                     } else {
-                        println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
+                        println!("    Skipping dependency: {dep_name} (not found in 3rd-party)");
                     }
                 } else {
-                    println!("    Skipping dependency: {} (not found in metadata)", dep_name);
+                    println!("    Skipping dependency: {dep_name} (not found in metadata)");
                 }
             }
             Item::Value(Value::InlineTable(table)) => {
@@ -294,9 +307,7 @@ fn update_dependencies(
                         // Add path
                         table.insert(
                             "path",
-                            Value::String(toml_edit::Formatted::new(
-                                rel_path.to_string_lossy().to_string(),
-                            )),
+                            Value::String(toml_edit::Formatted::new(rel_path.to_string_lossy().to_string())),
                         );
 
                         // Add features if any
@@ -308,12 +319,15 @@ fn update_dependencies(
                             table.insert("features", Value::Array(feature_array));
                         }
 
-                        println!("    Updated dependency: {} -> path = {}, features = {:?}", dep_name, rel_path.display(), features);
+                        println!(
+                            "    Updated dependency: {dep_name} -> path = {}, features = {features:?}",
+                            rel_path.display(),
+                        );
                     } else {
-                        println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
+                        println!("    Skipping dependency: {dep_name} (not found in 3rd-party)");
                     }
                 } else {
-                    println!("    Skipping dependency: {} (not found in metadata)", dep_name);
+                    println!("    Skipping dependency: {dep_name} (not found in metadata)");
                 }
             }
             Item::Table(table) => {
@@ -354,12 +368,15 @@ fn update_dependencies(
                             table.insert("features", Item::Value(Value::Array(feature_array)));
                         }
 
-                        println!("    Updated dependency: {} -> path = {}, features = {:?}", dep_name, rel_path.display(), features);
+                        println!(
+                            "    Updated dependency: {dep_name} -> path = {}, features = {features:?}",
+                            rel_path.display(),
+                        );
                     } else {
-                        println!("    Skipping dependency: {} (not found in 3rd-party)", dep_name);
+                        println!("    Skipping dependency: {dep_name} (not found in 3rd-party)");
                     }
                 } else {
-                    println!("    Skipping dependency: {} (not found in metadata)", dep_name);
+                    println!("    Skipping dependency: {dep_name} (not found in metadata)");
                 }
             }
             _ => {}
@@ -374,11 +391,8 @@ fn find_package_for_dependency<'a>(
     package_name: Option<&'a str>,
 ) -> Option<(&'a cargo_metadata::Package, Vec<String>)> {
     let resolve = metadata.resolve.as_ref()?;
-    let package_map: HashMap<PackageId, &cargo_metadata::Package> = metadata
-        .packages
-        .iter()
-        .map(|p| (p.id.clone(), p))
-        .collect();
+    let package_map: HashMap<PackageId, &cargo_metadata::Package> =
+        metadata.packages.iter().map(|p| (p.id.clone(), p)).collect();
 
     // Find the package in the resolved dependency graph
     for node in &resolve.nodes {
@@ -393,13 +407,12 @@ fn find_package_for_dependency<'a>(
 }
 
 fn get_package_name_from_table(table: &toml_edit::InlineTable, _dep_name: &str) -> Option<String> {
-    table.get("package")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    table.get("package").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 fn get_package_name_from_table_item(table: &Table, _dep_name: &str) -> Option<String> {
-    table.get("package")
+    table
+        .get("package")
         .and_then(|item| item.as_str())
         .map(|s| s.to_string())
 }

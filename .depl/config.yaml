@@ -1,0 +1,130 @@
+project_name: cargo-localize
+version: 5
+langs:
+  - rust
+targets:
+  - arch: x86_64
+    os: linux
+    os_derivative: any
+    os_version:
+      type: no
+cache_files:
+  - .git
+  - Cargo.lock
+  - target
+variables: []
+pipelines:
+  - title: build
+    desc: Got from `Deployer Pipeline`.
+    info: cargo-localize-default@0.1.0
+    tags:
+      - cargo
+      - clippy
+      - build
+      - upx
+    default: true
+    artifacts:
+      - target/release/cargo-localize
+    artifacts_placements:
+      - from: target/release/cargo-localize
+        to: cargo-localize
+    actions:
+      - title: Lint
+        info: cargo-clippy@0.1.0
+        tags:
+          - cargo
+          - clippy
+        requirements:
+          - type: exists_any
+            paths:
+              - /bin/cargo
+              - ~/.cargo/bin/cargo
+        action:
+          type: pre_build
+          supported_langs:
+            - rust
+          commands:
+            - bash_c: cargo clippy
+              show_success_output: true
+      - title: Format
+        info: cargo-fmt@0.1.0
+        tags:
+          - rust
+          - cargo
+          - fmt
+        exec_in_project_dir: true
+        action:
+          type: pre_build
+          supported_langs:
+            - rust
+          commands:
+            - bash_c: cargo fmt -- --config tab_spaces=4,max_width=120 */**/*.rs
+      - title: Build
+        info: cargo-rel@0.1.0
+        tags:
+          - rust
+          - cargo
+        requirements:
+          - type: exists_any
+            paths:
+              - /bin/cargo
+              - ~/.cargo/bin/cargo
+        action:
+          type: build
+          supported_langs:
+            - rust
+          commands:
+            - bash_c: cargo build --release
+      - title: Compress
+        info: upx@0.1.0
+        tags:
+          - upx
+        requirements:
+          - type: exists_any
+            paths:
+              - /usr/bin/upx
+              - ~/.local/bin/upx
+        action:
+          type: post_build
+          supported_langs:
+            - any
+          commands:
+            - bash_c: upx <artifact>
+              show_bash_c: false
+              placeholders:
+                - <artifact>
+              replacements:
+                - group:
+                    - from: <artifact>
+                      to:
+                        title: target/release/cargo-localize
+                        is_secret: false
+                        value:
+                          type: plain
+                          value: target/release/cargo-localize
+      - title: Install to ~/.cargo/bin
+        info: install-to-cargo-bin@0.1.1
+        tags:
+          - cargo
+        action:
+          type: install
+          target:
+            arch: x86_64
+            os: linux
+            os_derivative: any
+            os_version:
+              type: no
+          commands:
+            - bash_c: cp -f <artifact> ~/.cargo/bin
+              show_bash_c: false
+              placeholders:
+                - <artifact>
+              replacements:
+                - group:
+                    - from: <artifact>
+                      to:
+                        title: target/release/cargo-localize
+                        is_secret: false
+                        value:
+                          type: plain
+                          value: target/release/cargo-localize
